@@ -48,6 +48,7 @@ my $taxids;
 my $mode;
 my $invert;
 my $threads = 1;
+my $keep_unclassified;
 
 
 sub usage {
@@ -57,13 +58,15 @@ sub usage {
 			 Requires CPAN module Parallel::ForkManager (you can install with '\$ cpanm install Parallel::ForkManager')
 	\n
 	USAGE:	kolander.pl v0.1.0 --input kraken.report.txt --taxonomy ncbi.taxids --output sieved_report.txt
-	-i | --input      FILE; Path to input Kraken2 report from stdout stream (not --report option!)
-	-o | --output     STR;  Output file name, format will match the input report format
-	-t | --taxonomy   FILE; Path to file containing tab-delimited taxids
-	-l | --taxids     CSV;  List of NCBI taxids to capture.  Can also be given as a file with one taxid per line.
-	-m | --mode       STR;  Mode to use for filtering -- either 'at', 'below'.  [ Default: below ]
-	-v | --invert     FLAG; Invert the taxid list and filter only records NOT matching those taxids. [ Default: OFF ]
-	-p | --threads    INT;  Number of parallel threads to use for report processing. [ Default: 1 ]
+	-i | --input               FILE; Path to input Kraken2 report from stdout stream (not --report option!)
+	-o | --output              STR;  Output file name, format will match the input report format
+	-t | --taxonomy            FILE; Path to file containing tab-delimited taxids
+	-l | --taxids              CSV;  List of NCBI taxids to capture.  Can also be given as a file with one taxid per line.
+	-m | --mode                STR;  Mode to use for filtering -- either 'at', 'below'.  [ Default: below ]
+	-v | --invert              FLAG; Invert the taxid list and filter only records NOT matching those taxids. [ Default: OFF ]  Note
+			                         Note: --invert does NOT change handling behavior of unclassified sequences.  Use --keep_unclassified.
+	-p | --threads             INT;  Number of parallel threads to use for report processing. [ Default: 1 ]
+	-k | --keep_unclassified   FLAG; Retain unclassified reads during filtering? [ Default: OFF ]
 \n";
 	print $usage;
 }
@@ -75,12 +78,14 @@ GetOptions(	'i|input=s' => \$input,
 			'm|mode=s' => \$mode,
 			'v|invert' => \$invert,
 			'p|threads=i' => \$threads,
+			'k|keep_unclassified' => \$keep_unclassified,
 ) or die usage();
 
 # Parameter setups
 $mode = ( $mode && ($mode eq "at" ||  $mode eq "below") )? $mode : "below";
 $threads = ( $threads > 1 )? $threads : 1;
 $invert = ( $invert )? 1 : 0;
+$keep_unclassified = ( $keep_unclassified )? 1 : 0;
 
 # Parse taxids
 die "URKKK No taxids given!\n" if ( not $taxids );
@@ -131,7 +136,12 @@ while ( <$fh> )	{
 	chomp $_;
 	
 	# Skip reads that are unclassified, not much we can do with these here
-	next if ( $_ =~ /^U/ && $invert == 0 );		
+	if ( $_ =~ /^U/ )	{
+		if ( $keep_unclassified == 0 ) 	{
+			print $fhout join("\t", @record), "\n";
+		}
+		next;
+	}
 	
 	# Parse to get this record's taxid
 	my @record = split("\t", $_);
