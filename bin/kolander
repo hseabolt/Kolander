@@ -1,0 +1,182 @@
+#!/usr/bin/env perl
+
+# kolander.pl v0.1.0
+# Author: MH Seabolt
+# Last updated: 3-16-2023
+
+# SYNOPSIS
+# Accepts a tab-delimited report from Kraken2's standard output stream, which assigns a taxid per read in the input set.
+# The goal of this program is to parse this report to capture all reads at or below (i.e. lower taxonomy) than a given input set of NCBI taxids.
+
+##################################################################################
+# The MIT License
+#
+# Copyright (c) 2023 Matthew H. Seabolt
+#
+# Permission is hereby granted, free of charge, 
+# to any person obtaining a copy of this software and 
+# associated documentation files (the "Software"), to 
+# deal in the Software without restriction, including 
+# without limitation the rights to use, copy, modify, 
+# merge, publish, distribute, sublicense, and/or sell 
+# copies of the Software, and to permit persons to whom 
+# the Software is furnished to do so, 
+# subject to the following conditions:
+#
+# The above copyright notice and this permission notice 
+# shall be included in all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, 
+# EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES 
+# OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. 
+# IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR 
+# ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, 
+# TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE 
+# SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+##################################################################################
+
+use strict;
+use warnings;
+use Getopt::Long qw(GetOptions);
+use Parallel::ForkManager;
+
+# GetOpts Variable declarations
+my $input = "--";
+my $output = "--";
+my $taxonomy;
+my $taxids;
+my $mode;
+my $invert;
+my $threads = 1;
+
+
+sub usage {
+	my $usage = "kolander.pl v0.1.0\n
+	PURPOSE: Accepts a tab-delimited report from Kraken2's standard output stream, which assigns a taxid per read in the input set.
+			 The goal of this program is to parse this report to capture all reads at or below (i.e. lower taxonomy) than a given input set of NCBI taxids.
+			 Requires CPAN module Parallel::ForkManager (you can install with '\$ cpanm install Parallel::ForkManager')
+	\n
+	USAGE:	kolander.pl v0.1.0 --input kraken.report.txt --taxonomy ncbi.taxids --output sieved_report.txt
+	-i | --input      FILE; Path to input Kraken2 report from stdout stream (not --report option!)
+	-o | --output     STR;  Output file name, format will match the input report format
+	-t | --taxonomy   FILE; Path to file containing tab-delimited taxids
+	-l | --taxids     CSV;  List of NCBI taxids to capture.  Can also be given as a file with one taxid per line.
+	-m | --mode       STR;  Mode to use for filtering -- either 'at', 'below'.  [ Default: below ]
+	-v | --invert     FLAG; Invert the taxid list and filter only records NOT matching those taxids. [ Default: OFF ]
+	-p | --threads    INT;  Number of parallel threads to use for report processing. [ Default: 1 ]
+\n";
+	print $usage;
+}
+
+GetOptions(	'i|input=s' => \$input, 
+			't|taxonomy=s' => \$taxonomy,
+			'o|output=s' => \$output,
+			'l|taxids=s' => \$taxids,
+			'm|mode=s' => \$mode,
+			'v|invert' => \$invert,
+			'p|threads=i' => \$threads,
+) or die usage();
+
+# Parameter setups
+$mode = ( $mode && ($mode eq "at" ||  $mode eq "below") )? $mode : "below";
+$threads = ( $threads > 1 )? $threads : 1;
+$invert = ( $invert )? 1 : 0;
+
+# Parse taxids
+die "URKKK No taxids given!\n" if ( not $taxids );
+my @taxids;
+if ( -e $taxids )	{
+	open(TAXIDS, "<", $taxids) or die "$!\n";
+		@taxids = <TAXIDS>;
+	close TAXIDS;
+	chomp $_ foreach (@taxids);
+}
+else {
+	@taxids = split(",", $taxids);
+}
+
+# Generate a lookup table of NCBI taxonomy IDs from the reference file
+my %Taxonomy = ();
+if ( $taxonomy =~ /\.gz$/ )	{	open(TAXONOMY, "-|", "gzip -dc $taxonomy") or die "Gunzip file $taxonomy: $!\n";	}
+else                        {	open(TAXONOMY, "<", $taxonomy) or die "$!\n";	}
+while ( <TAXONOMY> )	{
+	chomp $_;
+	my @line = grep { /\S/ } split("\t", $_);
+	my $taxid = shift @line;
+	$Taxonomy{$taxid} = \@line;
+}
+close TAXONOMY;
+
+##################################################################################
+# Read the first input data file
+my $fh = *STDIN;
+my $succin = open(REPORT, "<", "$input") if ( $input ne "--" && -e $input );
+$fh = *REPORT if ( $succin ); 
+
+# Open the output filehandle
+my $succout = open( OUT, ">", "$output" ) if $output ne "--";
+my $fhout;
+if ( $succout )		{	$fhout = *OUT;		}
+else				{	$fhout = *STDOUT;	}
+
+# Initialize parallel manager
+my $pm = Parallel::ForkManager->new($threads);
+
+# Process the incoming report data
+while ( <$fh> )	{
+	# Kick off child process
+	$pm->start and next;
+	
+	# Begin processing loop
+	chomp $_;
+	
+	# Skip reads that are unclassified, not much we can do with these here
+	next if ( $_ =~ /^U/ && $invert == 0 );		
+	
+	# Parse to get this record's taxid
+	my @record = split("\t", $_);
+	my $id = $record[2];
+	
+	# Look up this taxid in %Taxonomy and get all parent/ancestor nodes
+	my @ancestor_nodes = ( exists $Taxonomy{$id} )? @{$Taxonomy{$id}} : ();
+	my @taxid_nodes;
+	foreach my $lookup ( @taxids ) 	{
+		push @taxid_nodes, @{$Taxonomy{$lookup}};
+	}
+	
+	# Compute the intersection between @ancestor_nodes and @taxids 
+	my %Isec = ();
+	my %Union = ();
+	foreach my $e ( @ancestor_nodes, @taxid_nodes ) { $Union{$e}++ && $Isec{$e}++ }
+	my @isec = keys %Isec;
+	
+	# If there are any taxids in the intersection, do some logic to determine if/how we want to print it back out
+	if ( scalar @isec == 0  )	{
+		if ( $invert == 1 )	{
+			print $fhout join("\t", @record), "\n";
+			next;
+		}
+		else 	{
+			next;
+		}
+	}
+	elsif ( $mode eq "at" )	{
+		if ( grep {$id eq $_} @taxids )	{
+			if ( $invert == 0 )	{	print $fhout join("\t", @record), "\n";	}
+			else 	            {	next;	}
+		}
+		else 	{
+			if ( $invert == 1 ) { print $fhout join("\t", @record), "\n";	}
+		}
+	}
+	elsif ( $mode eq "below" ) {
+		if ( $invert == 0 ) { print $fhout join("\t", @record), "\n"; }
+	}
+	
+	# Close out the child process
+	$pm->finish;
+}
+close $fh if ( $succin );
+close $fhout if ( $succout );
+
+exit;

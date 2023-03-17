@@ -16,10 +16,12 @@ process KRAKEN2 {
     output:
     tuple val(meta), path("*results.krona")                , emit: results_for_krona
     tuple val(meta), path("*kraken2_report.txt")           , emit: report
+    tuple val(meta), path("*.kraken2.kraken")              , emit: kraken_output
     path "versions.yml"                                    , emit: versions
 
     script:
     def prefix = task.ext.prefix ?: "${meta.id}"
+    def gzip = reads[0].endsWith('gz') ? "--gzip-compressed" : ""
     def input = meta.single_end ? "\"${reads}\"" :  "--paired \"${reads[0]}\" \"${reads[1]}\""
     """
     kraken2 \
@@ -27,8 +29,10 @@ process KRAKEN2 {
         --threads ${task.cpus} \
         --db database \
         --report ${prefix}.kraken2_report.txt \
-        $input \
-        > ${prefix}.kraken2.kraken
+        --output ${prefix}.kraken2.kraken \
+        $gzip \
+        $input
+        
     cat ${prefix}.kraken2.kraken | cut -f 2,3 > ${prefix}.results.krona
 
     cat <<-END_VERSIONS > versions.yml

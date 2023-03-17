@@ -16,8 +16,8 @@ if(hasExtension(params.input, "csv")){
         .from(file(params.input))
         .splitCsv(header: true)
         .map { row ->
-                if (row.size() != 6) {
-                    log.error "Input samplesheet contains row with ${row.size()} column(s). Expects 6."
+                if (row.size() != 5) {
+                    log.error "Input samplesheet contains row with ${row.size()} column(s). Expects 5."
                     System.exit(1)        
                 }
             }
@@ -29,7 +29,7 @@ WorkflowKolander.initialise(params, log)
 
 // TODO nf-core: Add all file path parameters for the pipeline to the list below
 // Check input path parameters to see if they exist
-def checkPathParamList = [ params.input, params.multiqc_config ]
+def checkPathParamList = [ params.input, params.kraken2_db, params.multiqc_config ]
 for (param in checkPathParamList) { if (param) { file(param, checkIfExists: true) } }
 
 // Check mandatory parameters
@@ -65,7 +65,10 @@ include { POOL_PAIRED_READS                                   } from '../modules
 include { POOL_SINGLE_READS as POOL_LONG_READS                } from '../modules/local/pool_single_reads'
 include { POOL_FASTA                                          } from '../modules/local/pool_fasta'
 include { KRAKEN2_DB_PREPARATION                              } from '../modules/local/kraken2_db_preparation'
-include { KRAKEN2                                             } from '../modules/local/kraken2'
+include { KRAKEN2 as KRAKEN2_ORIG                             } from '../modules/local/kraken2'
+include { KRAKEN2 as KRAKEN2_SIEVED                           } from '../modules/local/kraken2'
+include { KOLANDER as KOLANDER_SCRIPT                         } from '../modules/local/kolander'
+include { SEQKIT_GREP                                         } from '../modules/local/seqkit_grep'
 include { KRONA_DB                                            } from '../modules/local/krona_db'
 include { KRONA                                               } from '../modules/local/krona'
 include { MULTIQC                                             } from '../modules/nf-core/multiqc/main'
@@ -84,15 +87,14 @@ workflow KOLANDER {
 
     ch_versions           = Channel.empty()
     ch_reads_for_taxonomy = Channel.empty()
+    ch_kraken2_db         = Channel.value( file("${params.kraken2_db}") )
 
     //
     // SUBWORKFLOW: Read in samplesheet, validate and stage input files
     //
     INPUT_CHECK ()
-    ch_raw_short_reads = INPUT_CHECK.out.raw_short_reads
-    ch_raw_long_reads  = INPUT_CHECK.out.raw_long_reads
-    ch_fasta           = INPUT_CHECK.out.fasta
-    ch_versions        = ch_versions.mix(INPUT_CHECK.out.versions)
+    ch_short_reads = INPUT_CHECK.out.raw_short_reads
+    ch_long_reads  = INPUT_CHECK.out.raw_long_reads
 
     // Concatenate reads if required
     if ( params.concatenate_reads ) {
@@ -120,18 +122,7 @@ workflow KOLANDER {
                 meta.group       = group
                 [ meta, reads.collect { it } ]
             }
-        // fasta files
-        // group and set group as new id
-        ch_fasta_grouped = ch_fasta
-            .map { meta, fasta -> [meta.group, meta, fasta ] }
-            .groupTuple(by: 0)
-            .map { group, metas, fastas -> 
-                def meta = [:]
-                meta.id = "group-$group"
-                meta.group = group
-                [ meta, fastas.collect { it } ]
-            }
-
+        
         // pool short reads
         if ( params.single_end ){
             POOL_SHORT_SINGLE_READS ( ch_short_reads_grouped )
@@ -145,33 +136,52 @@ workflow KOLANDER {
         POOL_LONG_READS ( ch_long_reads_grouped )
         ch_long_reads = POOL_LONG_READS.out.reads
 
-        // fasta files
-        POOL_FASTA ( ch_fasta_grouped )
-        ch_fasta = POOL_FASTA.out.fasta
-
     } else {
-         ch_short_reads_grouped = ch_short_reads
+         ch_short_reads = ch_short_reads
             .map { meta, reads ->
-                    if (!params.single_end){ [ meta, [reads[0]], [reads[1]] ] }
-                    else [ meta, [reads], [] ] }
+                    if (!params.single_end){ [ meta, [ reads[0], reads[1] ] ] }
+                    else [ meta, [reads] ] }
     }
-
-    ch_reads_for_taxonomy = ch_reads_for_taxonomy.mix(
-
-    )
-
-    
+    ch_reads_for_taxonomy = ch_reads_for_taxonomy.mix(ch_short_reads, ch_long_reads)
 
     // Pass reads through Kraken2 
+    ch_profiles = Channel.empty()
+    ch_results_for_kolander = Channel.empty()
+    ch_results_for_krona = Channel.empty()
     KRAKEN2_DB_PREPARATION (
         ch_kraken2_db
     )
-    KRAKEN2 ( 
-        ch_reads_for_taxonomy, KRAKEN2_DB_PREPARATION.out.db
+    KRAKEN2_ORIG ( 
+        ch_short_reads, KRAKEN2_DB_PREPARATION.out.db
     )
-    ch_versions = ch_versions.mix(KRAKEN2.out.versions)
-    ch_profiles = ch_profiles.mix(KRAKEN2.out.report)
-    ch_results_for_krona = ch_results_for_krona.mix(KRAKEN2.out.results_for_krona)
+    ch_versions = ch_versions.mix(KRAKEN2_ORIG.out.versions)
+    ch_profiles = ch_profiles.mix(KRAKEN2_ORIG.out.report)
+    ch_results_for_kolander = ch_results_for_kolander.mix(KRAKEN2_ORIG.out.kraken_output)
+
+    // Sieve reads through the Kolander program
+    ch_seived_readids = Channel.empty()
+    ch_seived_reports = Channel.empty()
+    KOLANDER_SCRIPT (
+        ch_results_for_kolander, params.taxids
+    )
+    ch_versions = ch_versions.mix(KRAKEN2_ORIG.out.versions)
+    ch_seived_reports = ch_seived_reports.mix(KOLANDER_SCRIPT.out.filtered_report)
+    ch_seived_readids = ch_seived_readids.mix(KOLANDER_SCRIPT.out.results_for_seqkit)
+
+    // Separate out FastQ files based on Kolander results using SeqKit
+    ch_seived_readids_and_reads = ch_seived_readids.join(ch_reads_for_taxonomy)
+    SEQKIT_GREP (
+        ch_seived_readids_and_reads
+    )
+    ch_versions = ch_versions.mix(KRAKEN2_ORIG.out.versions)
+    
+    // Re-run Kraken2 for final outputs
+    ch_profiles_final = Channel.empty()
+    KRAKEN2_SIEVED ( 
+        SEQKIT_GREP.out.filtered_fastx, KRAKEN2_DB_PREPARATION.out.db
+    )
+    ch_profiles_final = ch_profiles_final.mix(KRAKEN2_SIEVED.out.report)
+    ch_results_for_krona = ch_results_for_krona.mix(KRAKEN2_SIEVED.out.results_for_krona)
 
     // Generate a Krona HTML plot
     if ( !params.skip_krona ){
@@ -182,7 +192,6 @@ workflow KOLANDER {
         )
         ch_versions = ch_versions.mix(KRONA.out.versions)
     }
-
 
     CUSTOM_DUMPSOFTWAREVERSIONS (
         ch_versions.unique().collectFile(name: 'collated_versions.yml')
@@ -201,7 +210,9 @@ workflow KOLANDER {
     ch_multiqc_files = ch_multiqc_files.mix(ch_workflow_summary.collectFile(name: 'workflow_summary_mqc.yaml'))
     ch_multiqc_files = ch_multiqc_files.mix(ch_methods_description.collectFile(name: 'methods_description_mqc.yaml'))
     ch_multiqc_files = ch_multiqc_files.mix(CUSTOM_DUMPSOFTWAREVERSIONS.out.mqc_yml.collect())
-    ch_multiqc_files = ch_multiqc_files.mix(FASTQC.out.zip.collect{it[1]}.ifEmpty([]))
+    ch_multiqc_files = ch_multiqc_files.mix(KRAKEN2_SIEVED.out.report.collect{it[1]}.ifEmpty([]))
+    ch_multiqc_files = ch_multiqc_files.mix(KRONA.out.html.collect{it[1]}.ifEmpty([]))
+
 
     MULTIQC (
         ch_multiqc_files.collect(),
